@@ -133,13 +133,13 @@ This phase focuses on establishing the core project structure and contracts.
   - ✅ The following directories are created: `api/v1`, `internal`, `services`, `pkg`.
   - ✅ A `Makefile` is created with placeholder targets for `build`, `test`, and `protoc`.
 
-### ✅ Task 1.2: Initialize GitOps Repository (`skyeye-gitops`)
+### Task 1.2: Initialize GitOps Repository (`skyeye-gitops`)
 
 - **Description:** Set up the `skyeye-gitops` repository that will hold all Kubernetes and Helm configurations for ArgoCD.
 - **Definition of Done:**
-  - ✅ A `skyeye-gitops` directory exists.
-  - ✅ The following directories are created: `apps`, `base/skyeye-app`, `envs/staging`, `envs/prod`, `infrastructure`.
-  - ✅ Placeholder `.yaml` files are created as per the PRD structure (e.g., `apps/staging.yaml`).
+  - A `skyeye-gitops` directory exists.
+  - The following directories are created: `apps`, `base/skyeye-app`, `envs/staging`, `envs/prod`, `infrastructure`.
+  - Placeholder `.yaml` files are created as per the PRD structure (e.g., `apps/staging.yaml`).
 
 ### Task 1.3: Define Protobuf Contracts
 
