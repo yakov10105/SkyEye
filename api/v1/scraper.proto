@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package v1;
+
+option go_package = "SkyEye/api/v1";
+
+// ScrapeJob represents a job to be scraped by the Scraper service.
+message ScrapeJob {
+  string job_id = 1;
+  string url = 2;
+  int32 max_retries = 3;
+  string correlation_id = 4; // Used for tracing and linking requests
+}
+
+// ScrapeResult represents the outcome of a scraping job.
+message ScrapeResult {
+  enum Status {
+    UNKNOWN = 0;
+    SUCCESS = 1;
+    FAILURE = 2;
+  }
+
+  string job_id = 1;
+  Status status = 2;
+  string data = 3; // The scraped content, e.g., HTML or JSON
+  string error_message = 4; // Populated if status is FAILURE
+}
+
+// ScraperService defines the gRPC service for scraping operations (if we were to use gRPC for direct calls, though currently RabbitMQ is primary).
+// This can be expanded later if direct gRPC calls are introduced.
+service ScraperService {
+  // rpc Scrape(ScrapeRequest) returns (ScrapeResponse); // Example, not implemented yet
+}
