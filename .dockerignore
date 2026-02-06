@@ -1,0 +1,31 @@
+# Git
+.git/
+.gitignore
+
+# Go-specific
+go.mod
+go.sum
+go.work
+go.work.sum
+
+# Documentation
+*.md
+
+# Test files
+*_test.go
+
+# Temp files
+*.tmp
+
+# Local config
+config.local.yaml
+
+# IDE settings
+.vscode/
+.idea/
+
+# Gemini CLI files
+.gemini/
+
+# Makefile
+Makefile

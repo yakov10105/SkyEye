@@ -3,7 +3,8 @@ package messaging
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
+	"os"
 	"time"
 
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -26,24 +27,27 @@ type Connection struct {
 	closed     chan *amqp.Error
 	propagator propagation.TextMapPropagator
 	tracer     trace.Tracer
+	logger     *slog.Logger
 }
 
 // NewConnection creates a new RabbitMQ connection with retry logic.
 func NewConnection(uri string) (*Connection, error) {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	conn := &Connection{
 		uri:        uri,
 		propagator: otel.GetTextMapPropagator(),
 		tracer:     otel.Tracer(tracerName),
+		logger:     logger,
 	}
 
 	for i := 0; i < maxRetries; i++ {
 		err := conn.connect()
 		if err == nil {
-			log.Println("RabbitMQ connected successfully.")
+			conn.logger.Info("RabbitMQ connected successfully.")
 			go conn.handleReconnect()
 			return conn, nil
 		}
-		log.Printf("Failed to connect to RabbitMQ (attempt %d/%d): %v. Retrying in %v...", i+1, maxRetries, err, reconnectDelay)
+		conn.logger.Error("Failed to connect to RabbitMQ", "attempt", i+1, "max_attempts", maxRetries, "error", err, "retry_in", reconnectDelay)
 		time.Sleep(reconnectDelay)
 	}
 	return nil, fmt.Errorf("failed to connect to RabbitMQ after %d retries", maxRetries)
@@ -70,20 +74,27 @@ func (c *Connection) connect() error {
 
 // handleReconnect listens for connection closures and attempts to reconnect.
 func (c *Connection) handleReconnect() {
-	for range c.closed {
-		log.Println("RabbitMQ connection closed. Attempting to reconnect...")
+	for err := range c.closed {
+		if err != nil {
+			c.logger.Warn("RabbitMQ connection closed", "error", err.Error())
+		} else {
+			c.logger.Warn("RabbitMQ connection closed gracefully")
+		}
+
+		c.logger.Info("Attempting to reconnect to RabbitMQ...")
 		for i := 0; i < maxRetries; i++ {
 			err := c.connect()
 			if err == nil {
-				log.Println("RabbitMQ reconnected successfully.")
-				break
+				c.logger.Info("RabbitMQ reconnected successfully.")
+				return // Exit the reconnect loop on success
 			}
-			log.Printf("Failed to reconnect to RabbitMQ (attempt %d/%d): %v. Retrying in %v...", i+1, maxRetries, err, reconnectDelay)
+			c.logger.Error("Failed to reconnect to RabbitMQ", "attempt", i+1, "max_attempts", maxRetries, "error", err, "retry_in", reconnectDelay)
 			time.Sleep(reconnectDelay)
 		}
-		if c.Conn == nil || c.Conn.IsClosed() {
-			log.Fatalf("Permanent failure to reconnect to RabbitMQ after %d retries. Exiting.", maxRetries)
-		}
+		c.logger.Error("Fatal: could not reconnect to RabbitMQ after multiple retries. Further action may be needed.")
+		// In a real app, you might want to exit, or have a more robust health check system.
+		// For now, we will stop trying to reconnect after maxRetries.
+		return
 	}
 }
 
@@ -96,14 +107,13 @@ func (c *Connection) Publish(ctx context.Context, exchange, routingKey string, m
 		return fmt.Errorf("RabbitMQ channel is not open")
 	}
 
-	headers := make(amqp.Table)
 	carrier := make(propagation.MapCarrier)
-	for k, v := range headers {
-		if s, ok := v.(string); ok {
-			carrier[k] = s
-		}
-	}
 	c.propagator.Inject(ctx, carrier)
+
+	headers := make(amqp.Table)
+	for k, v := range carrier {
+		headers[k] = v
+	}
 
 	return c.Channel.PublishWithContext(
 		ctx,
@@ -113,8 +123,9 @@ func (c *Connection) Publish(ctx context.Context, exchange, routingKey string, m
 		false, // immediate
 		amqp.Publishing{
 			Headers:     headers,
-			ContentType: "application/protobuf", // Assuming Protobuf based on PRD
+			ContentType: "application/protobuf",
 			Body:        msg,
+			DeliveryMode: amqp.Persistent, // Ensure messages are not lost on restart
 		},
 	)
 }
@@ -143,8 +154,7 @@ func (c *Connection) Consume(ctx context.Context, queue string, handler func(con
 
 	go func() {
 		for d := range msgs {
-			// Extract OpenTelemetry trace context
-			carrier := propagation.MapCarrier{}
+			carrier := make(propagation.MapCarrier)
 			for k, v := range d.Headers {
 				if s, ok := v.(string); ok {
 					carrier[k] = s
@@ -152,35 +162,40 @@ func (c *Connection) Consume(ctx context.Context, queue string, handler func(con
 			}
 			msgCtx := c.propagator.Extract(ctx, carrier)
 
-			spanCtx, span := c.tracer.Start(msgCtx, "RabbitMQ Consume")
-
-			err := handler(spanCtx, d.Body)
+			_, span := c.tracer.Start(msgCtx, "RabbitMQ Consume", trace.WithSpanKind(trace.SpanKindConsumer))
+			
+			err := handler(msgCtx, d.Body)
 			if err != nil {
-				log.Printf("Error processing message: %v. Nacking message...", err)
-				d.Nack(false, true) // Requeue
+				c.logger.Error("Error processing message, nacking", "error", err)
+				d.Nack(false, false) // Nack and don't requeue, send to DLX if configured
 			} else {
 				d.Ack(false)
 			}
 			span.End()
 		}
-		log.Println("RabbitMQ consumer stopped.")
+		c.logger.Info("RabbitMQ consumer stopped.")
 	}()
 
 	return nil
 }
 
+
 // Close closes the RabbitMQ connection and channel.
 func (c *Connection) Close() error {
-	if c.Channel != nil && !c.Channel.IsClosed() {
-		if err := c.Channel.Close(); err != nil {
-			log.Printf("Error closing RabbitMQ channel: %v", err)
-		}
-	}
 	if c.Conn != nil && !c.Conn.IsClosed() {
+		// Stop listening for close notifications before explicitly closing
+		// to avoid triggering the reconnect logic.
+		close(c.closed)
+		
+		if err := c.Channel.Close(); err != nil {
+			c.logger.Error("Error closing RabbitMQ channel", "error", err)
+		}
 		if err := c.Conn.Close(); err != nil {
 			return fmt.Errorf("error closing RabbitMQ connection: %w", err)
 		}
+		c.logger.Info("RabbitMQ connection and channel closed successfully.")
+		return nil
 	}
-	log.Println("RabbitMQ connection and channel closed.")
+	c.logger.Info("RabbitMQ connection already closed.")
 	return nil
 }
