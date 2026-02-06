@@ -3,188 +3,196 @@ package messaging_test
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"sync"
 	"testing"
 	"time"
 
+	"SkyEye/internal/messaging"
+
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
-	"SkyEye/internal/messaging" // Import our messaging package
-
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
+	"go.opentelemetry.io/otel/propagation"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	semconv "go.opentelemetry.io/otel/semconv/v1.7.0"
-	otelpropagation "go.opentelemetry.io/otel/propagation"
+	semconv "go.opentelemetry.io/otel/semconv/v1.21.0"
 )
 
 var (
 	rabbitMQConn *messaging.Connection
 	rabbitMQURI  string
 	pool         *dockertest.Pool
-	dockerResource *dockertest.Resource
+	dockerRes    *dockertest.Resource
+	exporter     *memoryExporter
+	logger       *slog.Logger
 )
 
+type memoryExporter struct {
+	mu    sync.Mutex
+	spans []sdktrace.ReadOnlySpan
+}
+
+func (e *memoryExporter) ExportSpans(ctx context.Context, spans []sdktrace.ReadOnlySpan) error {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.spans = append(e.spans, spans...)
+	return nil
+}
+
+func (e *memoryExporter) Shutdown(ctx context.Context) error {
+	e.reset()
+	return nil
+}
+
+func (e *memoryExporter) getSpans() []sdktrace.ReadOnlySpan {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	spans := make([]sdktrace.ReadOnlySpan, len(e.spans))
+	copy(spans, e.spans)
+	return spans
+}
+
+func (e *memoryExporter) reset() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.spans = nil
+}
+
 func TestMain(m *testing.M) {
+	logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug}))
 	var err error
 
-	// Setup OpenTelemetry for testing
-	setupOpenTelemetry()
+	exporter = &memoryExporter{}
+	setupOpenTelemetry(exporter)
 
-	// Connect to Docker
 	pool, err = dockertest.NewPool("")
 	if err != nil {
-		log.Fatalf("Could not connect to docker: %s", err)
+		logger.Error("Could not connect to docker", "error", err)
+		os.Exit(1)
 	}
 
-	// Pull RabbitMQ image and run container
-	dockerResource, err = pool.RunWithOptions(&dockertest.RunOptions{
-		Repository: "rabbitmq",
-		Tag:        "3.13-management-alpine",
-		ExposedPorts: []string{"5672/tcp", "15672/tcp"},
-		Env: []string{
-			"RABBITMQ_DEFAULT_USER=guest",
-			"RABBITMQ_DEFAULT_PASS=guest",
-		},
-	}, func(config *docker.HostConfig) {
-		// Set AutoRemove to true so that stopped container goes away by itself.
+	opts := &dockertest.RunOptions{
+		Repository:   "rabbitmq",
+		Tag:          "3.13-management-alpine",
+		ExposedPorts: []string{"5672/tcp"},
+		Env:          []string{"RABBITMQ_DEFAULT_USER=guest", "RABBITMQ_DEFAULT_PASS=guest"},
+	}
+
+	dockerRes, err = pool.RunWithOptions(opts, func(config *docker.HostConfig) {
 		config.AutoRemove = true
 		config.RestartPolicy = docker.RestartPolicy{Name: "no"}
 	})
 	if err != nil {
-		log.Fatalf("Could not start resource: %s", err)
+		logger.Error("Could not start resource", "error", err)
+		os.Exit(1)
 	}
 
-	// Set the URI for RabbitMQ
-	rabbitMQURI = fmt.Sprintf("amqp://guest:guest@localhost:%s/", dockerResource.GetPort("5672/tcp"))
-		
-	// Retry connecting to RabbitMQ
+	rabbitMQURI = fmt.Sprintf("amqp://guest:guest@%s", dockerRes.GetHostPort("5672/tcp"))
+	logger.Info("RabbitMQ running at", "uri", rabbitMQURI)
+
 	if err = pool.Retry(func() error {
 		var connErr error
 		rabbitMQConn, connErr = messaging.NewConnection(rabbitMQURI)
-		if connErr != nil {
-			return connErr
-		}
-		// Try to open a channel to confirm connection is fully ready
-		// Accessing the exported Channel field
-		if rabbitMQConn.Channel == nil { 
-			return fmt.Errorf("channel not initialized")
-		}
-		return nil // Connection and channel are ready
+		return connErr
 	}); err != nil {
-		log.Fatalf("Could not connect to RabbitMQ after retries: %s", err)
+		logger.Error("Could not connect to RabbitMQ", "error", err)
+		if pErr := pool.Purge(dockerRes); pErr != nil {
+			logger.Error("Could not purge resource", "error", pErr)
+		}
+		os.Exit(1)
 	}
 
-	// Run tests
 	code := m.Run()
 
-	// Clean up
-	if err = pool.Purge(dockerResource); err != nil {
-		log.Fatalf("Could not purge resource: %s", err)
+	if err = pool.Purge(dockerRes); err != nil {
+		logger.Error("Could not purge resource", "error", err)
 	}
 
 	os.Exit(code)
 }
 
-func setupOpenTelemetry() {
-	exporter, err := stdouttrace.New(stdouttrace.WithPrettyPrint())
-	if err != nil {
-		log.Fatalf("Failed to create stdout exporter: %v", err)
-	}
-
+func setupOpenTelemetry(exp sdktrace.SpanExporter) {
 	tp := sdktrace.NewTracerProvider(
-		sdktrace.WithSampler(sdktrace.AlwaysSample()),
-		sdktrace.WithBatchProcessor(sdktrace.NewSimpleProcessor(exporter)),
+		sdktrace.WithBatcher(exp),
 		sdktrace.WithResource(resource.NewWithAttributes(
 			semconv.SchemaURL,
 			semconv.ServiceNameKey.String("test-messaging-service"),
-			attribute.String("environment", "test"),
 		)),
 	)
 	otel.SetTracerProvider(tp)
-	otel.SetTextMapPropagator(otelpropagation.TraceContext{})
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}))
 }
 
-func TestPublishAndConsume(t *testing.T) {
-	ctx := context.Background()
-	queueName := "test_queue"
-	messageBody := []byte("Hello, RabbitMQ!")
+func TestPublishAndConsumeWithTracePropagation(t *testing.T) {
+	exporter.reset()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 
-	// Declare a queue using the exported Channel
-	_, err := rabbitMQConn.Channel.QueueDeclare(
-		queueName,
-		false, // durable
-		false, // delete when unused
-		false, // exclusive
-		false, // no-wait
-		nil,   // arguments
-	)
-	if err != nil {
-		t.Fatalf("Failed to declare a queue: %v", err)
-	}
+	queueName := "test_trace_queue"
+	messageBody := []byte("Hello, Tracing!")
+
+	_, err := rabbitMQConn.Channel.QueueDeclare(queueName, true, false, false, false, nil)
+	require.NoError(t, err, "Failed to declare queue")
 
 	var wg sync.WaitGroup
 	wg.Add(1)
 
-	// Start consuming
-	consumedMessages := make(chan []byte, 1)
-	err = rabbitMQConn.Consume(ctx, queueName, func(msgCtx context.Context, body []byte) error {
+	handler := func(msgCtx context.Context, body []byte) error {
 		defer wg.Done()
-		_, span := otel.Tracer("test").Start(msgCtx, "test consume handler")
+		assert.Equal(t, messageBody, body)
+		_, span := otel.Tracer("test-consumer").Start(msgCtx, "consume-handler")
 		defer span.End()
-
-		consumedMessages <- body
 		return nil
-	})
-	if err != nil {
-		t.Fatalf("Failed to start consumer: %v", err)
 	}
 
-	// Publish a message
-	parentCtx, parentSpan := otel.Tracer("test").Start(ctx, "test publish operation")
+	err = rabbitMQConn.Consume(ctx, queueName, handler)
+	require.NoError(t, err, "Consume call failed")
+
+	parentCtx, parentSpan := otel.Tracer("test-publisher").Start(ctx, "publish-operation")
 	err = rabbitMQConn.Publish(parentCtx, "", queueName, messageBody)
+	require.NoError(t, err, "Publish call failed")
 	parentSpan.End()
-	if err != nil {
-		t.Fatalf("Failed to publish message: %v", err)
-	}
 
-	select {
-	case consumed := <-consumedMessages:
-		if string(consumed) != string(messageBody) {
-			t.Errorf("Consumed message mismatch: got %s, want %s", string(consumed), string(messageBody))
+	wg.Wait()
+
+	spans := exporter.getSpans()
+	require.Len(t, spans, 3, "Expected exactly three spans to be created")
+
+	var producerSpan, consumerSpan, handlerSpan sdktrace.ReadOnlySpan
+	for _, s := range spans {
+		switch s.Name() {
+		case "publish-operation":
+			producerSpan = s
+		case "RabbitMQ Consume":
+			consumerSpan = s
+		case "consume-handler":
+			handlerSpan = s
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("Message consumption timed out")
 	}
 
-	wg.Wait() // Wait for the consumer handler to finish
+	require.NotNil(t, producerSpan, "Producer span not found")
+	require.NotNil(t, consumerSpan, "Consumer span not found")
+	require.NotNil(t, handlerSpan, "Handler span not found")
+
+	assert.Equal(t, producerSpan.SpanContext().TraceID(), consumerSpan.SpanContext().TraceID())
+	assert.Equal(t, producerSpan.SpanContext().SpanID(), consumerSpan.Parent().SpanID())
+
+	assert.Equal(t, consumerSpan.SpanContext().TraceID(), handlerSpan.SpanContext().TraceID())
+	assert.Equal(t, consumerSpan.SpanContext().SpanID(), handlerSpan.Parent().SpanID())
 }
 
 func TestConnectionClose(t *testing.T) {
-	// Re-establish a connection for this test
 	tempConn, err := messaging.NewConnection(rabbitMQURI)
-	if err != nil {
-		t.Fatalf("Failed to create temporary connection: %v", err)
-	}
+	require.NoError(t, err, "Failed to create temporary connection for close test")
 
 	err = tempConn.Close()
-	if err != nil {
-		t.Errorf("Failed to close connection: %v", err)
-	}
+	assert.NoError(t, err, "Failed to close connection")
 
-	// Verify that subsequent operations fail
 	err = tempConn.Publish(context.Background(), "", "some_queue", []byte("test"))
-	if err == nil {
-		t.Errorf("Expected publish to fail on closed connection, but it succeeded")
-	}
-	expectedErr := "RabbitMQ connection is closed"
-	if err != nil && err.Error() != expectedErr {
-		t.Errorf("Expected error '%s', got '%s'", expectedErr, err.Error())
-	}
+	assert.Error(t, err, "Expected publish to fail on closed connection")
+	assert.Equal(t, "RabbitMQ connection is closed", err.Error())
 }
-
-// TODO: Add tests for retry logic and DLX (if implemented)
