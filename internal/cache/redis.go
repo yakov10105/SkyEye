@@ -75,6 +75,11 @@ func (c *Client) Eval(ctx context.Context, script string, keys []string, args ..
 	return result, nil
 }
 
+// Ping checks the connection to Redis.
+func (c *Client) Ping(ctx context.Context) error {
+	return c.rdb.Ping(ctx).Err()
+}
+
 // Close gracefully closes the Redis connection.
 func (c *Client) Close() error {
 	c.logger.Info("Closing Redis connection")
