@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"SkyEye/internal/cache"
+
 	"github.com/ory/dockertest/v3"
 	"github.com/ory/dockertest/v3/docker"
 	"github.com/redis/go-redis/v9"
@@ -46,7 +47,6 @@ func TestMain(m *testing.M) {
 
 	// Exponential backoff-retry, because the application in the container might not be ready to accept connections yet
 	if err := pool.Retry(func() error {
-		var err error
 		// Use a direct redis client to ping, not our wrapper
 		rdb := redis.NewClient(&redis.Options{Addr: redisURI})
 		return rdb.Ping(context.Background()).Err()

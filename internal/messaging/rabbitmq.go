@@ -93,8 +93,7 @@ func (c *Connection) handleReconnect() {
 		}
 		c.logger.Error("Fatal: could not reconnect to RabbitMQ after multiple retries. Further action may be needed.")
 		// In a real app, you might want to exit, or have a more robust health check system.
-		// For now, we will stop trying to reconnect after maxRetries.
-		return
+		// For now, we will wait for the next connection closure and try again.
 	}
 }
 
