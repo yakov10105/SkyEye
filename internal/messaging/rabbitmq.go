@@ -179,6 +179,14 @@ func (c *Connection) Consume(ctx context.Context, queue string, handler func(con
 }
 
 
+// IsClosed returns true if the connection is closed.
+func (c *Connection) IsClosed() bool {
+	if c.Conn == nil {
+		return true
+	}
+	return c.Conn.IsClosed()
+}
+
 // Close closes the RabbitMQ connection and channel.
 func (c *Connection) Close() error {
 	if c.Conn != nil && !c.Conn.IsClosed() {
