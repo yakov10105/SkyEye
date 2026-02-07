@@ -7,7 +7,9 @@ require (
 	github.com/go-redsync/redsync/v4 v4.15.0
 	github.com/google/uuid v1.6.0
 	github.com/spf13/viper v1.21.0
+	google.golang.org/protobuf v1.36.11
 	gorm.io/gorm v1.31.1
+	gorm.io/plugin/dbresolver v1.6.2
 )
 
 require (
